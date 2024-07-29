@@ -1,10 +1,8 @@
-#### help 명령어, test 명령어, chat_id 확인 기능 추가
+# group chat_id 확인. 수작업 용 
 import logging
 import os
 import requests
-from telegram import Update, Bot
-from telegram.ext import Application, ContextTypes, CommandHandler, MessageHandler, filters
-from bs4 import BeautifulSoup
+import json
 from dotenv import load_dotenv
 
 # 봇 토큰 로드
@@ -18,8 +16,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# update된 group chat ID 확인
-def getChatId():
+# 새로운 그룹의 chat_id를 수동으로 가져오는 함수
+def get_chatId_oneself(group_name):
     url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
     r = requests.get(url)
     data = r.json()
@@ -32,30 +30,24 @@ def getChatId():
         message = item.get("message")
         if message and "chat" in message:
             chat = message["chat"]
-            if chat.get("type") in ["group", "supergroup"]:
-                group_name = chat.get("title")
+            if chat.get("type") in ["group", "supergroup"] and chat.get("title") == group_name:
                 chat_id = chat.get("id")
-                
-                # .env 파일에서 해당 그룹의 chat_id가 이미 있는지 확인
-                if not is_chat_id_in_env(group_name, chat_id):
-                    append_to_env(group_name, chat_id)
-                    logger.info(f"새로운 그룹 추가: {group_name} (ID: {chat_id})")
-                else:
-                    logger.info(f"기존 그룹 확인: {group_name} (ID: {chat_id})")
-
-def is_chat_id_in_env(group_name, chat_id):
-    env_key = f"{group_name}_CHAT_ID"
-    return os.getenv(env_key) == str(chat_id)
-
-def append_to_env(group_name, chat_id):
-    with open(".env", "a") as f:
-        f.write(f"\n{group_name}_CHAT_ID={chat_id}\n")
-    # 환경 변수 다시 로드
-    load_dotenv()
-
+                print(chat_id)
+                return
+            
+    # chat_id를 찾은 경우
+    if chat_id: 
+        print(chat_id)
+        logger.info(f"새로운 그룹 chat id: {group_name} (ID: {chat_id})")
+        return chat_id
+    # chat_id를 찾지 못한 경우
+    else:
+        logger.error(f"{group_name}의 chat_id를 찾을 수 없습니다. 그룹 이름을 확인해 주세요.")
+        return None
 
 
 if __name__ == "__main__":
-    getChatId()
+    group_name = input("chat ID를 찾고자 하는 그룹채팅방 이름을 입력하세요: ")
+    get_chatId_oneself(group_name)
     
     
