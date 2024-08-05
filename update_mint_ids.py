@@ -20,22 +20,24 @@ logger = logging.getLogger(__name__)
 
 
 # config.json 파일 읽기 함수
-def read_config():
+async def read_config():
     try:
-        with open('config.json', 'r') as f:
-            return json.load(f)
+        with open('config.json', mode ='r', encoding = 'UTF-8') as f:
+            content = f.read()
+            print("File content:", content)
+            return json.loads(content)
     except FileNotFoundError:
         logger.error("config.json 파일을 찾을 수 없습니다.")
         return {}
-    except json.JSONDecodeError:
-        logger.error("config.json 파일의 형식이 잘못되었습니다.")
+    except json.JSONDecodeError as e:
+        logger.error(f"config.json 파일의 형식이 잘못되었습니다: {str(e)}")
         return {}
     
 # config.json 파일 업데이트 함수
-def update_config(config):
+async def update_config(config):
     try:
-        with open('config.json', 'w') as f:
-            json.dump(config, f, indent=4)
+        with open('config.json', mode = 'w', encoding='UTF-8') as f:
+            json.dump(config, f, indent=4, ensure_ascii=False)
         logger.info("config.json 파일이 업데이트되었습니다.")
     except IOError:
         logger.error("config.json 파일을 업데이트하는 중 오류가 발생했습니다.")
@@ -50,16 +52,17 @@ async def update_group_member_ids(update: Update, context: ContextTypes.DEFAULT_
         return
 
     try:
-        member_ids = [member.user.id for member in await chat.get_administrators()]
+        administrators = await chat.get_administrators()
+        member_ids = {member.user.first_name: member.user.id for member in administrators}
     except Exception as e:
         await update.message.reply_text(f"멤버 정보를 가져오는 데 실패했습니다: {str(e)}")
         return
     
     # config.json 파일 업데이트
-    config = read_config()
+    config = await read_config()
     config['mint_staff_ids'] = member_ids
     config['mint_group_chat_id'] = chat.id
-    update_config(config)
+    await update_config(config)
 
     await update.message.reply_text(f'''
                         Mint Staff ID가 업데이트되었습니다:
