@@ -2,7 +2,7 @@
 # MAIN 함수
 import json
 import pandas as pd
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from dotenv import load_dotenv
 import os
@@ -114,6 +114,13 @@ class StockAdvisory:
     async def initialize(self):
         self.config = await read_config()
 
+    async def start_checking_message_status(self):
+        while True:
+            msg_checking_tasks = [tracker.check_message_status(self.stock_name) for tracker in self.message_trackers.values()]
+            results = await asyncio.gather(*msg_checking_tasks)
+            if all(results):
+                break
+
     async def process(self, application: Application):
         """전체 수요예측 프로세스를 관리. 수요예측 의견을 전송하는 작업을 생성합니다. 발송 여부가 1인 기관들에 대해 메시지를 전송합니다. 
 
@@ -142,14 +149,13 @@ class StockAdvisory:
                 chat_ids_updated = True
                 new_chat_ids = await self.get_chat_ids(application, clients_needing_chat_id)
                 for client, chat_id in new_chat_ids.items():
-                    if chat_id:
-                        self.df.at[client, 'chatID'] = chat_id
+                    self.df.at[client, 'chatID'] = chat_id
 
 
             # 발송 여부가 1인 고객기관들에 대해 각각 task 생성하여 비동기로 처리
             tasks = [self.process_each_client(index, row, application, mint_group_chat_id, comment) for index, row in self.df[self.df['발송'] == 1].iterrows()]
             
-            results = await asyncio.gather(*tasks, return_exceptions=True)  # asyncio.gather()를 통해 모든 task를 병렬로 동시에 실행. 결과는 참여의견 메시지 객체
+            sent_results = await asyncio.gather(*tasks, return_exceptions=True)  # asyncio.gather()를 통해 모든 task를 병렬로 동시에 실행. 결과는 참여의견 메시지 객체
 
 
             # MessageTracker 인스턴스 생성
@@ -157,28 +163,30 @@ class StockAdvisory:
                 chat_id = row['chatID']
                 if pd.notna(chat_id):
                     tracker = MessageTracker(self.application, index, int(chat_id))
-                    await tracker.initialize()
+                    await tracker.initialize(self.stock_name)
                     self.message_trackers[index] = tracker
 
             # 참여의견 전송 실패 고객사 처리
             failed_clients = []
             
             # 의견을 발송해야 하는 고객사들의 인덱스와 process_each_client 메소드의 결과를 짝지어 순회
-            for index, result in zip(self.df[self.df['발송'] == 1].index, results):
+            for index, result in zip(self.df[self.df['발송'] == 1].index, sent_results):
                 # 결과가 예외 객체인 경우, 해당 고객사에 대한 처리가 실패했음을 의미
-                if isinstance(result, Exception):                                    
+                if isinstance(result, Exception) or result is None:                                    
                     logger.error(f"\"{self.stock_name}\" 참여의견을 \"{index}\"에 보내는 중 오류 발생: {str(result)}")
                     failed_clients.append(index)
                 # 참여의견 전송에 성공한 고객사에 대해 메시지 추적 시작
                 if index in self.message_trackers:
                     await self.message_trackers[index].start_tracking(self.stock_name, result)
-
-
+            
             # chatID을 못 찾았거나 다른 오류로 메시지 전송에 실패했을 때 민트 실무진 그룹채팅방에 알림
             if failed_clients:
                 sending_failed_message = "\n!!!!!!!!<긴급>!!!!!!!!\n".join([f" \"{self.stock_name}\" 참여의견을 \"{client}\"에 전송하지 못했습니다. 직접 보내주세요." for client in failed_clients])
-                await application.bot.send_message(chat_id=mint_group_chat_id, text=sending_failed_message)
+                await application.bot.send_message(chat_id=mint_group_chat_id, text=sending_failed_message, disable_notification=True)
 
+            
+            # 메시지 상태 체크 시작
+            await self.start_checking_message_status()
 
             # Chat ID가 업데이트 되었으면 수정된 DataFrame을 해당 종목의 엑셀 파일에 저장
             if chat_ids_updated:
@@ -188,7 +196,7 @@ class StockAdvisory:
                     logger.error(f"\"{self.stock_name}\"의 DataFrame을 엑셀 파일에 저장하는 중 오류 발생: {str(e)}")
 
 
-            # logger.info(f"\"{self.stock_name}\" 수요예측 프로세스 완료.")
+            logger.info(f"\"{self.stock_name}\" 수요예측 프로세스 완료.")
 
 
         except Exception as e:
@@ -196,18 +204,18 @@ class StockAdvisory:
             raise
 
 
-    async def process_each_client(self, index: str, row: pd.Series, application: Application, mint_group_chat_id: int, comment: str) -> Optional[int]:
-        """특정 종목에 대해 StockAdvisory 클래스를 생성했으므로 각 개별 클라이언트에 대한 처리를 담당합니다. Chat ID를 확인하고, 메시지를 전송하는 등의 작업을 수행.
+    async def process_each_client(self, index: str, row: pd.Series, application: Application, mint_group_chat_id: int, comment: str) -> Message:
+        """특정 종목에 대해 StockAdvisory 클래스를 생성했으므로 해당 종목 수요예측에 참여하는 각 고객사에 대한 처리를 담당합니다. Chat ID를 확인하고, 메시지를 전송하는 등의 작업을 수행.
 
         Args:
-            index ( DF의 인덱스): DataFrame의 인덱스. 여기서는 고객기관명
-            row ( Series ): DataFrame의 특정 행 series
+            index ( DF의 인덱스 ): DataFrame의 인덱스. 여기서는 고객기관명
+            row ( Series ): DataFrame에서 특정 행 series
             application ( Application ): 실행하고 있는 Application 객체
             mint_group_chat_id ( int ): 민트 실무진 그룹 채팅방의 chat_id
             comment ( string ): 수요예측 의견의 코멘트
         
         Returns:
-            Message: 참여의견 메시지 객체
+            Message: 전송된 참여의견 메시지 객체. ㅈ전송 실패 시 None 반환
         
         Raises:
             Exception: "민트-{index}" 그룹 Chat ID를 찾을 수 없는 경우 또는 메시지 전송 중 오류 발생 시
@@ -216,14 +224,14 @@ class StockAdvisory:
             chat_id = row['chatID']
 
             if pd.isna(chat_id):
-                logger.info(f"\"민트-{index}\" 그룹 Chat ID를 찾을 수 없습니다. config.json 파일을 확인하세요.")
+                logger.info(f"\"민트-{index}\" 그룹 Chat ID가 잘 못 입력되어 있습니다. 엑셀 파일과 config.json 파일을 확인하세요.")
                 return None
             
             # DataFrame의 'chatID' 필드의 값이 config.json 파일 값과 일치하는 경우, 해당 Chat ID로 메시지 전송
             if chat_id == self.config["client_group_chat_id"][f"민트-{index}"]:
                 sent_message = await self.send_advisory(application, chat_id, row, comment, index)
                 if sent_message:
-                    await application.bot.send_message(chat_id=mint_group_chat_id, text=f"\"{index}\"에 \"{self.stock_name}\" 참여의견 메시지를 전송했습니다.")
+                    await application.bot.send_message(chat_id=mint_group_chat_id, text=f"\"{index}\"에 \"{self.stock_name}\" 참여의견 메시지를 전송했습니다.", disable_notification=True)
                     return sent_message
                 else:
                     logger.error(f"\"{self.stock_name}\" 참여의견을 \"{index}\"에 전송하지 못했습니다.")
@@ -238,7 +246,7 @@ class StockAdvisory:
 
 
     # 수요예측 의견 전송 함수
-    async def send_advisory(self, application, chat_id, row, comment, client_name):
+    async def send_advisory(self, application: Application, chat_id: int, row: pd.Series, comment: str, client_name: str) -> Message:
         """수요예측 참여의견 메시지를 전송합니다. 참여의견 전송 후 메시지 추적기를 통해 고객사의 답장 유무를 추적하고 참여내역을 확인합니다.
 
         Args:
@@ -249,23 +257,24 @@ class StockAdvisory:
             client_name (string): 기관명
         
         Returns:
-            Message: 전송된 참여의견 메시지 객체
+            Message: 전송된 참여의견 메시지 객체. 전송 실패 시 None 반환
         """
 
         message = f"""
         {comment}
         ———————————————————————————————
-        참여가격: {row['참여가격']}원
-        참여수량: {row['참여수량']}
-        확약여부: {row['확약여부']}
+참여가격: {row['참여가격']}원
+참여수량: {row['참여수량']}
+확약여부: {row['확약여부']}
         """
         try:
-            sent_message = await application.bot.send_message(chat_id=chat_id, text=message)
+            sent_message = await application.bot.send_message(chat_id=chat_id, text=message, disable_notification=True)
             logger.info(f"\"{self.stock_name}\" 참여의견을 \"{client_name}\"에 성공적으로 전송했습니다.")
             return sent_message
             
         except Exception as e:
             logger.error(f"\"{self.stock_name}\" 참여의견을 \"{client_name}\"에 보내는 중 오류 발생: {str(e)}")
+            await application.bot.send_message(chat_id=self.mint_group_chat_id, text=f"\"{self.stock_name}\" 참여의견을 \"{client_name}\"에 전송하지 못했습니다. 직접 보내주세요.", disable_notification=True)
             return None
 
     # 엑셀에 없는 그룹의 Chat ID를 config.json 파일에서 가져오는 함수
@@ -291,8 +300,9 @@ class StockAdvisory:
                 chat_ids[client] = self.config['client_group_chat_id'][group_name]
                 logger.info(f"config.json 파일에서 \"{group_name}\" 그룹 Chat ID를 찾아서 반환합니다.")
             else:
+                chat_ids[client] = None
                 logger.error(f"config.json 파일에서 \"{group_name}\" 그룹 Chat ID를 찾을 수 없습니다.")
-                application.bot.send_message(chat_id=self.config['mint_group_chat_id'], text=f"\"{group_name}\" 그룹 Chat ID를 찾을 수 없습니다. 직접 보내주세요.")
+                application.bot.send_message(chat_id=self.config['mint_group_chat_id'], text=f"\"{group_name}\" 그룹 Chat ID를 찾을 수 없습니다. 참여의견을 직접 보내주세요.", disable_notification=True)
 
         return chat_ids
 
@@ -322,8 +332,7 @@ async def save_dataframe_to_excel(df, file_name, sheet_name):
         # Chat ID 열만 업데이트
         for r_idx, row in enumerate(dataframe_to_rows(chat_id_df, index=True, header=False), 2): # chat_id_df를 행 단위로 변환.
             for c_idx, value in enumerate(row[1:], 6): # ChatID는 6번째 열(F열)에 있음.
-                if pd.notna(value): # 빈 셀이나 누락된 데이터는 무시.
-                    sheet.cell(row=r_idx, column=c_idx, value=value)
+                sheet.cell(row=r_idx, column=c_idx, value=value)
         
         # 변경사항 저장
         try:
@@ -343,21 +352,27 @@ async def save_dataframe_to_excel(df, file_name, sheet_name):
 
 # 종목 참여내역 통합 처리 함수
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    chat_id = message.chat_id
+    if update.message is None:
+        return # 메시지가 없는 업데이트는 무시
+    
+    chat_id = update.message.chat_id
+    group_name = update.message.chat.title if update.message.chat.type == 'group' else None
 
+    
     for stock_advisory in active_stocks.values():
         for tracker in stock_advisory.message_trackers.values():
-            if tracker.chat_id == chat_id:
-                await tracker.process_message(message)
-                logger.info(f"")
+            try:
+                if tracker.chat_id == chat_id:
+                    await tracker.process_message(update.message)
+                    logger.info(f"\n{group_name}\n 그룹에서 메시지를 받았습니다.")
+            except Exception as e:
+                logger.error(f"\"{group_name}\" 그룹에서 메시지를 받는 중 오류 발생: {str(e)}")
                 
 
 
 # main 함수
 async def main():
-    config = await read_config()
-    
+
     # 봇 생성
     application = Application.builder().token(TOKEN).pool_timeout(60).connection_pool_size(64).build()
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
@@ -372,7 +387,7 @@ async def main():
     global active_stocks
     active_stocks = {}
     
-    # await application.bot.send_message(chat_id=config['mint_group_chat_id'], text="프로그램이 시작되었습니다.")
+    #await application.bot.send_message(chat_id=config['mint_group_chat_id'], text="프로그램이 시작되었습니다.", disable_notification=True)
     logger.info("프로그램이 시작되었습니다.")
 
     try:
