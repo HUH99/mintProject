@@ -8,13 +8,14 @@ from dotenv import load_dotenv
 import os
 import logging
 import asyncio
-from asyncio import Lock, Event
+from asyncio import Lock, Event, Queue
 import aiohttp
 import aiofiles
 from openpyxl import load_workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
 from message_tracker import MessageTracker
 from typing import Dict, List, Tuple, Optional
+import signal
 
 # 봇 토큰 로드
 load_dotenv() # .env 파일에서 환경 변수를 로드하여 os.getenv()로 사용할 수 있게 함
@@ -157,14 +158,9 @@ class StockAdvisory:
             
             sent_results = await asyncio.gather(*tasks, return_exceptions=True)  # asyncio.gather()를 통해 모든 task를 병렬로 동시에 실행. 결과는 참여의견 메시지 객체
 
+            await application.bot.send_message(chat_id=mint_group_chat_id, text=f"\"{self.stock_name}\" 참여의견 메시지를 전송했습니다.")
 
-            # MessageTracker 인스턴스 생성
-            for index, row in self.df[self.df['발송'] == 1].iterrows():
-                chat_id = row['chatID']
-                if pd.notna(chat_id):
-                    tracker = MessageTracker(self.application, index, int(chat_id))
-                    await tracker.initialize(self.stock_name)
-                    self.message_trackers[index] = tracker
+            
 
             # 참여의견 전송 실패 고객사 처리
             failed_clients = []
@@ -173,16 +169,24 @@ class StockAdvisory:
             for index, result in zip(self.df[self.df['발송'] == 1].index, sent_results):
                 # 결과가 예외 객체인 경우, 해당 고객사에 대한 처리가 실패했음을 의미
                 if isinstance(result, Exception) or result is None:                                    
-                    logger.error(f"\"{self.stock_name}\" 참여의견을 \"{index}\"에 보내는 중 오류 발생: {str(result)}")
+                    logger.error(f"\"{self.stock_name}\" 참여의견을 \"{index}\"에 보내는 중 오류 발생하여 \"failed_clint\" 리스트에 추가: {str(result)}")
                     failed_clients.append(index)
+                    self.df.at[index, 'chatID'] = pd.NA
                 # 참여의견 전송에 성공한 고객사에 대해 메시지 추적 시작
-                if index in self.message_trackers:
-                    await self.message_trackers[index].start_tracking(self.stock_name, result)
+                else:
+                    chat_id = self.df.at[index, 'chatID']
+                    if pd.notna(chat_id):
+                        # MessageTracker 인스턴스 생성 및 초기화
+                        tracker = MessageTracker(self.application, index, int(chat_id))
+                        await tracker.initialize(self.stock_name)
+                        self.message_trackers[index] = tracker
+                        await self.message_trackers[index].start_tracking(self.stock_name, result)
             
             # chatID을 못 찾았거나 다른 오류로 메시지 전송에 실패했을 때 민트 실무진 그룹채팅방에 알림
             if failed_clients:
                 sending_failed_message = "\n!!!!!!!!<긴급>!!!!!!!!\n".join([f" \"{self.stock_name}\" 참여의견을 \"{client}\"에 전송하지 못했습니다. 직접 보내주세요." for client in failed_clients])
-                await application.bot.send_message(chat_id=mint_group_chat_id, text=sending_failed_message, disable_notification=True)
+                await application.bot.send_message(chat_id=mint_group_chat_id, text=sending_failed_message)
+                logger.error(f"\"{self.stock_name}\" 참여의견을 \"{failed_clients}\"에 전송하지 못했습니다. 직접 보내주세요.")
 
             
             # 메시지 상태 체크 시작
@@ -224,24 +228,25 @@ class StockAdvisory:
             chat_id = row['chatID']
 
             if pd.isna(chat_id):
-                logger.info(f"\"민트-{index}\" 그룹 Chat ID가 잘 못 입력되어 있습니다. 엑셀 파일과 config.json 파일을 확인하세요.")
+                logger.error(f"\"민트-{index}\" 그룹 Chat ID가 잘 못 입력되어 있습니다. 엑셀 파일과 config.json 파일을 확인하세요.")
                 return None
             
             # DataFrame의 'chatID' 필드의 값이 config.json 파일 값과 일치하는 경우, 해당 Chat ID로 메시지 전송
             if chat_id == self.config["client_group_chat_id"][f"민트-{index}"]:
                 sent_message = await self.send_advisory(application, chat_id, row, comment, index)
                 if sent_message:
-                    await application.bot.send_message(chat_id=mint_group_chat_id, text=f"\"{index}\"에 \"{self.stock_name}\" 참여의견 메시지를 전송했습니다.", disable_notification=True)
                     return sent_message
                 else:
-                    logger.error(f"\"{self.stock_name}\" 참여의견을 \"{index}\"에 전송하지 못했습니다.")
+                    no_msg_sent = f"process_each_client 메서드 ---\"{self.stock_name}\" 참여의견을 \"{index}\"에 전송 중: 메시지 객체 반환 오류 ."
+                    logger.error(no_msg_sent)
+                    await application.bot.send_message(chat_id=mint_group_chat_id, text=no_msg_sent)
                     return None
             else:
                 logger.error(f"{self.stock_name}.xlsx 에서 \"민트-{index}\" 그룹 Chat ID 가 config.json 파일과 일치하지 않습니다. 다시 한번 확인하세요.")
                 return None
             
         except Exception as e:
-            logger.error(f"\"{self.stock_name}\" 참여의견을 \"{index}\"에 보내는 중에 예기치 못한 오류 발생: {str(e)}")
+            logger.error(f"\"{self.stock_name}\" 참여의견을 \"{index}\" 보내는 중: DataFrame을 읽어올 때 예기치 못한 오류 발생: {str(e)}")
             return None
 
 
@@ -268,13 +273,13 @@ class StockAdvisory:
 확약여부: {row['확약여부']}
         """
         try:
-            sent_message = await application.bot.send_message(chat_id=chat_id, text=message, disable_notification=True)
+            sent_message = await application.bot.send_message(chat_id=chat_id, text=message)
             logger.info(f"\"{self.stock_name}\" 참여의견을 \"{client_name}\"에 성공적으로 전송했습니다.")
             return sent_message
             
         except Exception as e:
             logger.error(f"\"{self.stock_name}\" 참여의견을 \"{client_name}\"에 보내는 중 오류 발생: {str(e)}")
-            await application.bot.send_message(chat_id=self.mint_group_chat_id, text=f"\"{self.stock_name}\" 참여의견을 \"{client_name}\"에 전송하지 못했습니다. 직접 보내주세요.", disable_notification=True)
+            await application.bot.send_message(chat_id=self.mint_group_chat_id, text=f"\"{self.stock_name}\" 참여의견을 \"{client_name}\"에 전송하지 못했습니다. 직접 보내주세요.")
             return None
 
     # 엑셀에 없는 그룹의 Chat ID를 config.json 파일에서 가져오는 함수
@@ -302,13 +307,10 @@ class StockAdvisory:
             else:
                 chat_ids[client] = None
                 logger.error(f"config.json 파일에서 \"{group_name}\" 그룹 Chat ID를 찾을 수 없습니다.")
-                application.bot.send_message(chat_id=self.config['mint_group_chat_id'], text=f"\"{group_name}\" 그룹 Chat ID를 찾을 수 없습니다. 참여의견을 직접 보내주세요.", disable_notification=True)
+                application.bot.send_message(chat_id=self.config['mint_group_chat_id'], text=f"\"{group_name}\" 그룹 Chat ID를 찾을 수 없습니다. 참여의견을 직접 보내주세요.")
 
         return chat_ids
 
-    async def stop(self):
-        for tracker in self.message_trackers.values():
-            await tracker.stop()
 
 ###################### 여기까지 StockAdvisory 클래스 끝 #########################
 
@@ -358,21 +360,114 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     group_name = update.message.chat.title if update.message.chat.type == 'group' else None
 
-    
-    for stock_advisory in active_stocks.values():
-        for tracker in stock_advisory.message_trackers.values():
-            try:
+    try:    
+        handling_message_tasks = []
+        for stock_name, stock_advisory in active_stocks.items():
+            logger.info(f"Checking trackers for {stock_name}")
+            for client_name, tracker in stock_advisory.message_trackers.items():
+                logger.info(f"Checking tracker for {stock_name} - {client_name}")
                 if tracker.chat_id == chat_id:
-                    await tracker.process_message(update.message)
-                    logger.info(f"\n{group_name}\n 그룹에서 메시지를 받았습니다.")
-            except Exception as e:
-                logger.error(f"\"{group_name}\" 그룹에서 메시지를 받는 중 오류 발생: {str(e)}")
-                
+                    task = asyncio.create_task(tracker.process_message(update.message))
+                    handling_message_tasks.append((stock_name, client_name, task))
+                    
+        results = await asyncio.gather(*[task for _, _, task in handling_message_tasks], return_exceptions=True)
+
+        for (stock_name, client_name, _), result in zip(handling_message_tasks, results):
+            if isinstance(result, Exception):
+                logger.error(f"\"{stock_name}\"에 대한 메시지를 \"{client_name}\"로부터 받는 중 오류 발생: {str(result)}")
+            else:
+                logger.info(f"\"{stock_name}\"에 대한 메시지를 \"{client_name}\"로부터 받았습니다.")
+                    
+    except Exception as e:
+        logger.error(f"\"{group_name}\" 그룹에서 메시지를 받는 중 오류 발생: {str(e)}")
+
+    logger.info(f"\"{group_name}\" 그룹에서 메시지를 받았습니다.")
+
+
+# 사용자 입력을 비동기적으로 처리하는 함수
+async def user_input(input_queue: Queue):
+    while True:
+        stock_name = await asyncio.get_event_loop().run_in_executor(
+            None, input, '''
+----------------------------------------------------------------------
+
+     수요예측을 진행할 주식 종목명을 입력하세요 (종료하려면 'q' 입력):
+
+----------------------------------------------------------------------\n
+''')
+
+        if stock_name.lower() == 'q':
+            await input_queue.put('q')
+            break
+
+        file_name = f"{stock_name}.xlsx"
+
+        if file_name not in os.listdir(EXCEL_FOLDER):
+            print(f'''
+----------------------------------------------------------------------
+{stock_name} 파일이 {EXCEL_FOLDER}에 존재하지 않습니다. 다시 확인하고 입력하세요.")
+----------------------------------------------------------------------
+            ''')
+            continue
+
+        sheet_name = await asyncio.get_event_loop().run_in_executor(
+            None, input,'''
+----------------------------------------------------------------
+        수요예측 첫날이면 '1', 마지막날이면 '2'를 입력하세요:
+----------------------------------------------------------------
+
+        ''')
+
+        if sheet_name not in ['1', '2']:
+            print('''
+----------------------------------------------------------------
+                  
+            잘못된 입력입니다. '1' 또는 '2'를 입력해주세요.
+                  
+----------------------------------------------------------------
+                  
+                  '''
+                  )
+            continue
+
+        await input_queue.put((stock_name, sheet_name))
+
+
+# 하나의 종목에 대한 수요예측 인스턴스 생성 및 처리 시작
+async def process_stock(stock_name: str, sheet_name: str, application: Application):
+    try:
+        file_name = f"{stock_name}.xlsx"
+        df_first_day, df_last_day = read_advise_excel(file_name)
+        df = df_first_day if sheet_name == '1' else df_last_day
+        sheet_name = 'firstDay' if sheet_name == '1' else 'lastDay'
+
+        stock_advisory = StockAdvisory(stock_name, df, sheet_name, application)
+        active_stocks[stock_name] = stock_advisory
+        logger.info(f"{stock_name} 추가됨. 현재 active_stocks: {list(active_stocks.keys())}")
+
+        await stock_advisory.process(application)
+
+        print(f'''
+----------------------------------------------------------------
+              
+    {stock_name}의 수요예측 참여의견 전송 작업이 완료되었습니다!
+
+----------------------------------------------------------------
+        '''
+        )
+    
+    except Exception as e:
+        logger.error(f"{stock_name} 처리 중 오류 발생: {str(e)}")
+    
+    finally:
+        if stock_name in active_stocks:
+            del active_stocks[stock_name]
+        logger.info(f"{stock_name} 삭제됨. 현재 active_stocks: {list(active_stocks.keys())}")
+
 
 
 # main 함수
 async def main():
-
     # 봇 생성
     application = Application.builder().token(TOKEN).pool_timeout(60).connection_pool_size(64).build()
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
@@ -388,49 +483,35 @@ async def main():
     active_stocks = {}
     
     #await application.bot.send_message(chat_id=config['mint_group_chat_id'], text="프로그램이 시작되었습니다.", disable_notification=True)
-    logger.info("프로그램이 시작되었습니다.")
+    logger.info('''
+---------------------------------------------------------------
+                                
+                  프로그램이 시작되었습니다!
+                
+---------------------------------------------------------------
+                ''')
+
+    input_queue = Queue()
+    input_task = asyncio.create_task(user_input(input_queue))
 
     try:
         while True:
+            await asyncio.sleep(0.5)
             # 사용자로부터 수요예측을 진행할 종목명을 입력받음
-            stock_name = input("수요예측을 진행할 주식 종목명을 입력하세요 (종료하려면 'q' 입력): ")
-
-            if stock_name.lower() == 'q':
+            input_data = await input_queue.get()
+            if input_data == 'q':
                 break
-
-            sheet_name = input("수요예측 첫날이면 '1', 마지막날이면 '2'를 입력하세요: ").strip()
             
-            if sheet_name not in ['1', '2']:
-                logger.warning("잘못된 입력입니다. '1' 또는 '2'를 입력해주세요.")
-                continue
-
-            # '종목명.xlsx' 파일 읽기            
-            file_name = f"{stock_name}.xlsx"
-            try:
-                df_first_day, df_last_day = read_advise_excel(file_name)
-                df = df_first_day if sheet_name == '1' else df_last_day
-                sheet_name = 'firstDay' if sheet_name == '1' else 'lastDay'
-            except FileNotFoundError:
-                print(f"{file_name} 파일이 존재하지 않습니다.")
-                continue
-
-            # StockAdvisory 인스턴스 생성 및 처리
-            stock_advisory = StockAdvisory(stock_name, df, sheet_name, application)
-
-            active_stocks[stock_name] = stock_advisory # 오늘 수요예측 하는 모든 종목의 StockAdvisory 인스턴스 저장
-
-            # 비동기로 처리 시작
-            try:
-                await stock_advisory.process(application)
-            except Exception as e:
-                logger.error(f"{stock_name} 처리 중 오류 발생: {str(e)}")
-            
-            print(f"{stock_name}의 수요예측 참여의견 전송 작업이 완료되었습니다.")
-
-            print("다음 종목의 수요예측 의견을 전송하려면 새로운 종목명을 입력하세요.")
-            print("모든 처리를 마치고 프로그램을 종료하려면 'q'를 입력하세요.")
+            if isinstance(input_data, tuple) and len(input_data) == 2:
+                stock_name, sheet_name = input_data
+                asyncio.create_task(process_stock(stock_name, sheet_name, application))
+            else:
+                logger.warning(f"\n잘못된 입력입니다: {input_data}\n")
 
     finally:
+        # 사용자 입력 태스크 취소
+        input_task.cancel()
+
         # 애플리케이션 종료
         await application.stop()
 
@@ -440,20 +521,39 @@ async def main():
 
         # 폴링 태스크가 완전히 종료될 때까지 대기
         if polling_task and not polling_task.done():
+            polling_task.cancel()
             try:
-                await asyncio.wait_for(polling_task, timeout=10)
+                await asyncio.wait_for(polling_task, timeout=5)
             except asyncio.TimeoutError:
                 logging.warning("폴링 태스크가 시간 안에 완료되지 않았습니다.")
 
         # 모든 실행 중인 테스크 취소
-        for task in asyncio.all_tasks():
-            if task is not asyncio.current_task():
-                task.cancel()
+        tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        for task in tasks:
+            task.cancel()
         
         # 취소된 태스크들이 정리될 때까지 대기
-        await asyncio.gather(*asyncio.all_tasks(), return_exceptions=True)
+        await asyncio.gather(*tasks, return_exceptions=True)
 
-    print("프로그램을 종료합니다.")
 
-if __name__ == "__main__":
-    asyncio.run(main())
+    print('''
+--------------------------------------------------------------
+          
+                    프로그램을 종료합니다!
+          
+--------------------------------------------------------------
+          ''')
+
+if __name__ == "__main__":    
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n프로그램이 사용자에 의해 중단되었습니다.")
+    finally:
+        logging.info('''
+--------------------------------------------------------------
+                     
+                    성공적으로 종료되었습니다!
+                     
+--------------------------------------------------------------
+                     ''')

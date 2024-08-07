@@ -16,6 +16,7 @@ class MessageTracker:
     def __init__(self, application: Application, client_name: str, chat_id: int):
         self.application = application
         self.client_name = client_name
+
         self.chat_id = chat_id
         self.tracked_messages = {} # 트래킹 중인 메시지 정보 = {stock_name: message_info}
         self.config = None
@@ -93,23 +94,22 @@ class MessageTracker:
             logger.info(f"민트 실무진의 메시지는 무시합니다.")
             return # 민트 실무진의 메시지는 무시
 
+        processed = False
         for stock_name, info in list(self.tracked_messages.items()):
             if not info['replied'] and message.date > info['sent_time']:
                 await self.handle_reply(stock_name, message)
-                await self.message.reply_text("f{stock_name} 참여내역 확인해주시면 감사하겠습니다.")
-                return
+                processed = True
             elif info['replied'] and not info['confirmed'] and message.date > info['replied_time']:
                 # 참여내역 확인 프로세스
-                await self.handle_participation(stock_name, message)
-                await self.message.reply_text("f{stock_name} 참여내역 확인했습니다. 감사합니다.")
-                return
+                await self.handle_participation(stock_name, message)               
+                processed = True
         
-        logger.info(f"처리할 수 없는 메시지를 받았습니다: {message.text}")
+        if processed:
+            logger.info(f"{self.client_name}의 메시지를 처리했습니다: {message.text}")
+        else:
+            logger.info(f"{self.client_name}의 처리할 수 없는 메시지를 받았습니다: {message.text}")
+        return processed
         
-        # 모든 종목에 대해 replied와 confirmed가 True인지 확인
-        # all_completed = all(info['replied'] and info['confirmed'] for info in self.tracked_messages.values())
-        # if all_completed:
-        #    logger.info(f"{self.client_name}의 모든 종목에 대한 처리가 완료되었습니다.")
 
     async def handle_reply(self, stock_name: str, message: Message):
         self.tracked_messages[stock_name]['replied'] = True
@@ -137,18 +137,18 @@ class MessageTracker:
 
     async def check_reply_status(self, stock_name: str, info: dict, current_time: datetime):
         elapsed_time = (current_time - info['sent_time'].replace(tzinfo=timezone.utc)).total_seconds()
-        if 61 >= elapsed_time >= 60:  # 15분 (900초) 경과
+        if 121 >= elapsed_time >= 120:  # 15분 (900초) 경과
             await self.send_not_replied_alert(stock_name)
             self.tracked_messages[stock_name]['timeout'] = True
-        elif elapsed_time >= 30 and elapsed_time % 30 < 1:  # 5분마다
+        elif elapsed_time >= 60 and elapsed_time % 60 < 1:  # 5분마다
             await self.send_reply_reminder(stock_name)
 
     async def check_participation_status(self, stock_name: str, info: dict, current_time: datetime):
         elapsed_time = (current_time - info['replied_time'].replace(tzinfo=timezone.utc)).total_seconds()
-        if elapsed_time >= 60:  # 15분 (900초) 경과
+        if elapsed_time >= 120:  # 15분 (900초) 경과
             await self.send_not_confirmed_alert(stock_name)
             self.tracked_messages[stock_name]['timeout'] = True
-        elif 30 <= elapsed_time <= 31:  # 10분 지나면
+        elif 60 <= elapsed_time <= 1:  # 10분 지나면
             await self.send_participation_reminder(stock_name)
 
     async def send_reply_reminder(self, stock_name: str):
@@ -160,9 +160,9 @@ class MessageTracker:
 
     async def send_not_replied_alert(self, stock_name: str):
         alert_message = f"""
-        -----------------------------긴급-------------------------
-        \"{self.client_name}\"이 \"{stock_name}\" 참여의견을 확인하지 않았습니다!
-----------------------------------------------------------
+--------------------------------긴급----------------------------------\n
+\"{self.client_name}\"이 \"{stock_name}\" 참여의견을 확인하지 않았습니다!\n
+----------------------------------------------------------------------
         """
         await self.application.bot.send_message(
             chat_id=self.mint_group_chat_id,
@@ -173,23 +173,23 @@ class MessageTracker:
 
     async def send_not_confirmed_alert(self, stock_name: str):
         alert_message = f"""
-        -----------------------------긴급-------------------------
-        \"{self.client_name}\"이 \"{stock_name}\" 참여내역을 전송하지 않았습니다!
-----------------------------------------------------------
+--------------------------------긴급----------------------------------\n
+\"{self.client_name}\"이 \"{stock_name}\" 참여내역을 전송하지 않았습니다!\n
+----------------------------------------------------------------------
         """
         await self.application.bot.send_message(
             chat_id=self.mint_group_chat_id,
             text=alert_message
         )
         
-        logger.info(f"\"{self.client_name}\"이 \"{stock_name}\" 참여내역을 전송하지 않아 긴급 알림을 보냈습니다.")
-            
+        logger.info(f"\"{self.client_name}\"이(가) \"{stock_name}\" 참여내역을 전송하지 않아 긴급 알림을 보냈습니다.")
+
 
     # 참여내역 전송 리마인더
     async def send_participation_reminder(self, stock_name: str):
         await self.application.bot.send_message(
             chat_id=self.chat_id,
-            text=f"{stock_name} 참여내역 확인해주시면 감사하겠습니다."
+            text=f"\"{stock_name}\" 참여내역 확인해주시면 감사하겠습니다."
         )
 
     # 참여내역 확인 프로세스
